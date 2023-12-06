@@ -1,0 +1,322 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <HX711_ADC.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// -----------Constants-----------
+// Wifi connection
+const char *ssid = "XPACPRODUCTION";
+const char *password = "goXpacToNET888";
+
+// Server base url
+const char *serverUrl = "https://local-server-3igv.onrender.com/api/";
+
+// Analog pin connected to the battery through a voltage divider
+const int batteryPin = 34;
+
+// Battery voltages
+const float minVoltage = 0.;
+const float maxVoltage = 1.;
+
+// Load cell amplifier pins
+const int HX711_dout = 5;
+const int HX711_sck = 18;
+
+// Calibration value
+const float hardcodedCalibrationValue = 123.45;
+
+// Load cells ADC
+HX711_ADC LoadCell(HX711_dout, HX711_sck);
+
+// LCD display I2C
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// Sleeping time from 4:00 PM to 9:00 AM
+const int sleepStartHour = 16; // 4:00 PM
+const int sleepEndHour = 9;    // 9:00 AM
+const int sleepEndMinute = 0;  // Set the minute to 0
+
+// Function to check if it's time to sleep
+bool isSleepTime() {
+  int currentHour = hour();
+  int currentMinute = minute();
+
+  if (currentHour == sleepStartHour && currentMinute >= 0) {
+    return true; // It's sleep time
+  } else if (currentHour > sleepStartHour || currentHour < sleepEndHour) {
+    return true; // It's sleep time
+  } else if (currentHour == sleepEndHour && currentMinute <= sleepEndMinute) {
+    return true; // It's sleep time
+  }
+
+  return false; // It's not sleep time
+}
+
+// -----------Global variables-----------
+unsigned long t = 0;
+
+// -----------Function that initializes all settings before the code execution begins-----------
+void setup() {
+  Serial.begin(57600);
+  delay(10);
+
+  Serial.println();
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+  }
+
+  Serial.println("Connected to WiFi");
+
+  lcd.init();
+  lcd.backlight();
+
+  LoadCell.begin();
+  unsigned long stabilizingTime = 2000;
+  boolean _tare = true;
+  LoadCell.start(stabilizingTime, _tare);
+
+  if (LoadCell.getTareTimeoutFlag() || LoadCell.getSignalTimeoutFlag()) {
+    Serial.println("Timeout, check MCU > HX711 wiring and pin designations");
+    while (1);
+  } else {
+    float savedCalibrationValue = hardcodedCalibrationValue;
+    LoadCell.setCalFactor(savedCalibrationValue);
+
+    Serial.print("Loaded calibration value: ");
+    Serial.println(savedCalibrationValue);
+
+    lcd.setCursor(0, 2);
+    lcd.print("Calibration:");
+    lcd.print(savedCalibrationValue, 2);
+    lcd.print(" ");
+    lcd.print("units");
+
+    Serial.println("Startup is complete");
+  }
+
+  while (!LoadCell.update());
+
+  calibrate();
+}
+
+// -----------Function that runs all operations continuously-----------
+void loop() {
+  if (isSleepTime()) {
+    Serial.println("Sleeping...");
+    delay(1800000); // Sleep for 30 minutes (1800000 milliseconds)
+    Serial.println("Waking up...");
+  }
+
+  float batteryVoltage = getBatteryVoltage();
+  int batteryPercentage = (batteryVoltage / maxVoltage) * 100;
+
+  Serial.print("Voltage: ");
+  Serial.print(batteryVoltage);
+  Serial.println(" V");
+  Serial.print("Battery Percentage: ");
+  Serial.print(batteryPercentage);
+  Serial.println(" %");
+
+  sendBatteryInfo(batteryVoltage, batteryPercentage);
+
+  static boolean newDataReady = false;
+  const int serialPrintInterval = 0;
+
+  if (LoadCell.update())
+    newDataReady = true;
+
+  if (newDataReady) {
+    if (millis() > t + serialPrintInterval) {
+      float i = LoadCell.getData();
+
+      Serial.print("TOTAL MASS: ");
+      Serial.println(i);
+
+      lcd.setCursor(0, 0);
+      lcd.print("Count:");
+      lcd.print((i / 120), 0);
+      lcd.print(" units ");
+
+      newDataReady = false;
+      t = millis();
+
+      sendItemCountInfo((i / 120));
+    }
+  }
+
+  if (Serial.available() > 0) {
+    char inByte = Serial.read();
+    if (inByte == 't')
+      LoadCell.tareNoDelay();
+    else if (inByte == 'r')
+      calibrate();
+    else if (inByte == 'c')
+      changeSavedCalFactor();
+  }
+
+  if (LoadCell.getTareStatus() == true) {
+    Serial.println("Tare complete");
+  }
+}
+
+float getBatteryVoltage() {
+  int sensorValue = analogRead(batteryPin);
+  float voltage = sensorValue * ((maxVoltage - minVoltage) / 4095.0) + minVoltage;
+
+  delay(1000);
+
+  return voltage;
+}
+
+int estimateBatteryPercentage(float voltage) {
+  int percentage = map(voltage, minVoltage, maxVoltage, 0, 100);
+  return constrain(percentage, 0, 100);
+}
+
+void sendBatteryInfo(float voltage, int percentage) {
+  HTTPClient http;
+  String url = String(serverUrl) + "battery?battery=" + String(percentage);
+
+  http.begin(url);
+
+  int httpResponseCode = http.GET();
+
+  if (httpResponseCode > 0) {
+    String jsonResponse = http.getString();
+
+    Serial.println("HTTP Code: " + String(httpResponseCode));
+    Serial.println("Response: " + jsonResponse);
+  } else {
+    Serial.print("Error on sending request. Response code: ");
+    Serial.println(httpResponseCode);
+  }
+
+  http.end();
+}
+
+void sendItemCountInfo(int count) {
+  HTTPClient http;
+  String url = String(serverUrl) + "count?count=" + String(count);
+
+  http.begin(url);
+
+  int httpResponseCode = http.GET();
+
+  if (httpResponseCode > 0) {
+    String jsonResponse = http.getString();
+
+    Serial.println("HTTP Code: " + String(httpResponseCode));
+    Serial.println("Response: " + jsonResponse);
+  } else {
+    Serial.print("Error on sending request. Response code: ");
+    Serial.println(httpResponseCode);
+  }
+
+  http.end();
+}
+
+void calibrate() {
+  Serial.println("*");
+  Serial.println("Start calibration:");
+  Serial.println("Place the load cell on a level stable surface.");
+  Serial.println("Remove any load applied to the load cell.");
+  Serial.println("Send 't' from serial monitor to set the tare offset.");
+
+  boolean _resume = false;
+
+  while (_resume == false) {
+    LoadCell.update();
+    if (Serial.available() > 0) {
+      char inByte = Serial.read();
+      if (inByte == 't')
+        LoadCell.tareNoDelay();
+    }
+    if (LoadCell.getTareStatus() == true) {
+      Serial.println("Tare complete");
+      _resume = true;
+    }
+  }
+
+  Serial.println("Now, place your known mass on the load cell.");
+  Serial.println("Then send the weight of this mass (i.e., 100.0) from serial monitor.");
+
+  float known_mass = 0;
+  _resume = false;
+
+  while (_resume == false) {
+    LoadCell.update();
+    if (Serial.available() > 0) {
+      known_mass = Serial.parseFloat();
+      if (known_mass != 0) {
+        Serial.print("Known mass is: ");
+        Serial.println(known_mass);
+
+        lcd.setCursor(0, 1);
+        lcd.print("S.U.M:");
+        lcd.print(known_mass, 0);
+        lcd.print(" g");
+
+        _resume = true;
+      }
+    }
+  }
+
+  LoadCell.refreshDataSet();
+
+  float newCalibrationValue = LoadCell.getNewCalibration(known_mass);
+
+  Serial.print("New calibration value has been set to: ");
+  Serial.print(newCalibrationValue);
+  Serial.println(", use this as calibration value (calFactor) in your project sketch.");
+
+  Serial.println("End calibration");
+  Serial.println("*");
+}
+
+void changeSavedCalFactor() {
+  float oldCalibrationValue = LoadCell.getCalFactor();
+
+  boolean _resume = false;
+
+  Serial.println("*");
+  Serial.print("Current value is: ");
+  Serial.println(oldCalibrationValue);
+  Serial.println("Now, send the new value from serial monitor, i.e. 696.0");
+
+  float newCalibrationValue;
+
+  while (_resume == false) {
+    if (Serial.available() > 0) {
+      newCalibrationValue = Serial.parseFloat();
+      if (newCalibrationValue != 0) {
+        Serial.print("New calibration value is: ");
+        Serial.println(newCalibrationValue);
+        LoadCell.setCalFactor(newCalibrationValue);
+        _resume = true;
+      }
+    }
+  }
+
+  _resume = false;
+
+  Serial.print("Save this value to SPIFFS? y/n");
+
+  while (_resume == false) {
+    if (Serial.available() > 0) {
+      char inByte = Serial.read();
+      if (inByte == 'y') {
+        _resume = true;
+      } else if (inByte == 'n') {
+        Serial.println("Value not saved to SPIFFS");
+        _resume = true;
+      }
+    }
+  }
+
+  Serial.println("End change calibration value");
+  Serial.println("*");
+}
